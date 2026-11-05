@@ -1,0 +1,11 @@
+{
+  "name": "tree-sitter-v",
+  "version": "1.0.7",
+  "main": "bindings/node",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  }
+}

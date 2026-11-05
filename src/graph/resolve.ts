@@ -128,6 +128,7 @@ export function resolveEdges(
   // node ids. A `use App\Models\User` names a PSR-4 class whose file mirrors the namespace
   // tail under some (unknown) source root, so the suffix is the portable key.
   const phpFilesBySuffix = new Map<string, string[]>();
+  const vFilesByDirSuffix = new Map<string, string[]>();
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
@@ -149,6 +150,11 @@ export function resolveEdges(
       if (n.path.endsWith(".php")) {
         const parts = toPosixPath(n.path).split("/");
         for (let i = 0; i < parts.length; i++) push(phpFilesBySuffix, parts.slice(i).join("/"), n.id);
+      }
+      if (n.path.endsWith(".v") || n.path.endsWith(".vsh")) {
+        const dir = posix.dirname(toPosixPath(n.path));
+        const parts = dir === "." ? [] : dir.split("/");
+        for (let i = 0; i < parts.length; i++) push(vFilesByDirSuffix, parts.slice(i).join("/"), n.id);
       }
       {
         const p = toPosixPath(n.path);
@@ -216,7 +222,9 @@ export function resolveEdges(
                 ? resolveRustUse(e.specifier, e.file, byId, rustCrateRoots)
                 : e.file.endsWith(".php")
                   ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-                  : resolveImport(e.specifier, e.file, byId);
+                  : (e.file.endsWith(".v") || e.file.endsWith(".vsh"))
+                    ? resolveVImport(e.specifier, vFilesByDirSuffix)
+                    : resolveImport(e.specifier, e.file, byId);
       add(e.source, target, "imports", "extracted");
     } else if (e.relation === "extends" || e.relation === "implements") {
       // `implements` also resolves to a `trait` — PHP models trait composition
@@ -232,7 +240,9 @@ export function resolveEdges(
         // same-named symbol elsewhere in the repo cannot become a false edge.
         const targetFile = e.file.endsWith(".php")
           ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-          : resolveImport(e.specifier, e.file, byId);
+          : (e.file.endsWith(".v") || e.file.endsWith(".vsh"))
+            ? resolveVImport(e.specifier, vFilesByDirSuffix)
+            : resolveImport(e.specifier, e.file, byId);
         if (!byId.has(targetFile)) continue; // external or unresolved module
         const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
         if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted");
@@ -653,5 +663,19 @@ function resolveGoImport(spec: string, modules: GoModule[], filesByDir: Map<stri
   const dir = posix.normalize(posix.join(best.mod.dir, best.subpath));
   const files = filesByDir.get(dir);
   if (!files || files.length === 0) return spec;
+  return [...files].sort()[0];
+}
+
+/**
+ * Resolve a V import module path (e.g. `math` or `mymod.submod`) to an in-repo file node;
+ * otherwise return the raw specifier (stdlib like `os` or external module).
+ */
+function resolveVImport(spec: string, filesByDirSuffix: Map<string, string[]>): string {
+  const dirKey = spec.split(".").join("/");
+  const files = filesByDirSuffix.get(dirKey);
+  if (!files || files.length === 0) return spec;
+  const modName = spec.split(".").pop();
+  const match = files.find((f) => f.endsWith(`/${modName}.v`) || f === `${modName}.v`);
+  if (match) return match;
   return [...files].sort()[0];
 }

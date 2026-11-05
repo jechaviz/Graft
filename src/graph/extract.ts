@@ -15,12 +15,13 @@ import Java from "tree-sitter-java";
 import Kotlin from "tree-sitter-kotlin";
 import Swift from "tree-sitter-swift";
 import PHP from "tree-sitter-php";
+import V from "tree-sitter-v";
 import { basename } from "node:path";
 import { contentHash } from "../util/id.js";
-import { collectBindings, goReceiverVarOf, resolveRecvType, type FileBindings } from "./bindings.js";
+import { collectBindings, goReceiverVarOf, vReceiverVarOf, resolveRecvType, type FileBindings } from "./bindings.js";
 import type { Kind, NodeV1, Relation } from "./types.js";
 
-export type Language = "typescript" | "tsx" | "python" | "go" | "java" | "kotlin" | "swift" | "php" | "r";
+export type Language = "typescript" | "tsx" | "python" | "go" | "java" | "kotlin" | "swift" | "php" | "r" | "v";
 
 /**
  * Extension → the tree-sitter grammar that parses it, and the label a human expects
@@ -57,6 +58,8 @@ const EXTENSIONS: ReadonlyArray<{ ext: string; grammar: Language; label: string 
   // `entryFor` lower-cases the path before matching, so this one entry covers
   // both `.R` (the conventional case in real R codebases) and `.r`.
   { ext: ".r", grammar: "r", label: "r" },
+  { ext: ".vsh", grammar: "v", label: "v" },
+  { ext: ".v", grammar: "v", label: "v" },
 ];
 
 function entryFor(path: string): (typeof EXTENSIONS)[number] | undefined {
@@ -263,6 +266,16 @@ const PHP_KINDS: Record<string, Kind> = {
   enum_declaration: "enum",
 };
 
+const V_KINDS: Record<string, Kind> = {
+  function_declaration: "function",
+  struct_declaration: "struct",
+  interface_declaration: "interface",
+  interface_spec: "method",
+  enum_declaration: "enum",
+  type_declaration: "type",
+  const_spec: "constant",
+};
+
 const KINDS_BY_LANG: Record<Language, Record<string, Kind>> = {
   typescript: TS_KINDS,
   tsx: TS_KINDS,
@@ -273,6 +286,7 @@ const KINDS_BY_LANG: Record<Language, Record<string, Kind>> = {
   kotlin: KOTLIN_KINDS,
   swift: SWIFT_KINDS,
   php: PHP_KINDS,
+  v: V_KINDS,
 };
 
 /**
@@ -299,6 +313,7 @@ const CALL_TYPES: Record<Language, ReadonlySet<string>> = {
     "scoped_call_expression",
   ]),
   r: new Set(["call"]),
+  v: new Set(["call_expression"]),
 };
 
 const FUNCTION_VALUE_TYPES = new Set([
@@ -321,6 +336,7 @@ const GRAMMARS: Record<Language, unknown> = {
   kotlin: Kotlin,
   swift: Swift,
   php: PHP.php,
+  v: V,
 };
 
 export interface WalkCtx {
@@ -354,6 +370,8 @@ export interface WalkCtx {
   // for the method's whole body, only changing when a genuinely different
   // class is entered. Null outside any class, or for a class with no parent.
   rSuperClass: string | null;
+  // V: set of imported module identifiers in the current file (e.g. "math", "os", alias)
+  vImportedModules: ReadonlySet<string>;
 }
 
 /** A definition we're about to emit, normalized across the shapes we handle. */
@@ -425,6 +443,7 @@ export function extractFile(rel: string, source: string, lang: Language): Extrac
     rR6Access: null,
     rGenerics,
     rSuperClass: null,
+    vImportedModules: lang === "v" ? collectVImportedModules(root) : EMPTY_SET,
   };
   // Every id minted this file, seeded with the file node's own id (`rel`) so a
   // top-level definition can never collide with it. Threaded as its own
@@ -569,6 +588,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
     const id = mintId(base, minted);
     const isGoMethod = ctx.lang === "go" && node.type === "method_declaration";
+    const isVMethod = ctx.lang === "v" && desc.kind === "method";
     // The bare name of this node's OWN immediate enclosing class/receiver — for a
     // Go method that's its receiver type (methods aren't nested, so ctx.enclosingClass
     // wouldn't see it); for an R S3/S4 method it's the qualifier/class describeR
@@ -578,7 +598,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // ownerMethod index is the sole consumer (see NodeV1.owner's doc comment).
     const owner: string | undefined =
       desc.kind === "method"
-        ? (isGoMethod ? (goReceiverType(node) ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
+        ? (isGoMethod ? (goReceiverType(node) ?? undefined) : isVMethod ? (desc.owner ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
         : undefined;
     out.push({
       id,
@@ -592,17 +612,19 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           ? !desc.name.startsWith("_")
           : ctx.lang === "go"
             ? goExported(desc.name)
-            : ctx.lang === "r"
-              ? rExported(desc.name, ctx, node)
-              : ctx.lang === "java"
-                ? javaExported(node)
-                : ctx.lang === "kotlin"
-                  ? kotlinExported(node)
-                  : ctx.lang === "swift"
-                    ? swiftExported(node)
-                    : ctx.lang === "php"
-                      ? phpExported(node)
-                      : tsExported(node),
+            : ctx.lang === "v"
+              ? vExported(node)
+              : ctx.lang === "r"
+                ? rExported(desc.name, ctx, node)
+                : ctx.lang === "java"
+                  ? javaExported(node)
+                  : ctx.lang === "kotlin"
+                    ? kotlinExported(node)
+                    : ctx.lang === "swift"
+                      ? swiftExported(node)
+                      : ctx.lang === "php"
+                        ? phpExported(node)
+                        : tsExported(node),
       origin: "ast",
       body_hash: contentHash(desc.hashNode.text),
       body_text: searchBody(desc.hashNode.text),
@@ -620,24 +642,27 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
     const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
     const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
-    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
+    const vTypeDecl = ctx.lang === "v" && (desc.kind === "struct" || desc.kind === "interface");
+    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl || (ctx.lang === "v" && desc.kind === "struct"))
       edges.push(...heritageEdges(node, id, ctx));
     if (ctx.lang === "php") edges.push(...phpAttributeReferenceEdges(node, id, ctx));
     if (ctx.lang === "java") edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
 
     const enclosingClass =
-      desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
+      desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl || vTypeDecl
         ? desc.name
         : isGoMethod
           ? goReceiverType(node)
-          : (desc.owner ?? ctx.enclosingClass);
+          : isVMethod
+            ? (desc.owner ?? null)
+            : (desc.owner ?? ctx.enclosingClass ?? null);
     const childCtx: WalkCtx = {
       ...ctx,
       scope: [...ctx.scope, idPart],
       enclosingKind: desc.kind,
       parentId: id,
       enclosingClass,
-      goReceiverVar: isGoMethod ? goReceiverVarOf(node) : ctx.goReceiverVar,
+      goReceiverVar: isGoMethod ? goReceiverVarOf(node) : isVMethod ? vReceiverVarOf(node) : ctx.goReceiverVar,
       importedSymbols:
         desc.kind === "function" || desc.kind === "method"
           ? withoutShadowedImports(ctx.importedSymbols, node)
@@ -722,51 +747,68 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
     const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
     if (callee) {
-      const callEdge: RawEdge = {
-        source: ctx.parentId,
-        relation: "calls",
-        name: callee.name,
-        viaMember: callee.viaMember,
-        file: ctx.rel,
-        ...(callee.kinds ? { kinds: callee.kinds } : {}),
-      };
-      // Overloading languages: the call site's argument count, to pick the right
-      // overload (see RawEdge.argCount).
-      const argCount =
-        ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
-      if (argCount !== undefined) callEdge.argCount = argCount;
-      // Swift: a bare lowercase call inside a type body may be an implicit-`self`
-      // member call (`walk()` for `self.walk()`), syntactically indistinguishable
-      // from a free-function call — and Swift's own lookup is member-FIRST (inner
-      // scope wins). So the edge is emitted as the member reading, typed to the
-      // enclosing class — resolved through the owner-qualified method index and
-      // the class's in-repo ancestor chain (`clearLogs()` in a test subclass
-      // finds the base class's method) — with `implicitSelf` letting resolve.ts
-      // fall back to the free-function reading only when no member exists on the
-      // chain. One edge, both readings, language-order precedence. This is
-      // deliberately NOT a bare-name kind widening: dogfooding on
-      // swift-composable-architecture, a global unique-name match bound
-      // `contains(element)` inside `extension Set` — a stdlib call — to an
-      // unrelated type's only in-repo `contains`. And not for an UpperCamelCase
-      // callee: that is an initializer call (`Text("hi")`), which takes
-      // resolve.ts's class/struct/enum fallback instead — extension nodes (kind
-      // "module") can never false-match it.
-      const swiftImplicitSelf =
-        ctx.lang === "swift" &&
-        !callee.viaMember &&
-        !callee.kinds &&
-        ctx.enclosingClass &&
-        !/^[A-Z]/.test(callee.name);
-      if (swiftImplicitSelf) {
+      // V module function call (e.g. `math.create_calculator()`): callee.receiver is an imported module,
+      // so this is a module-level function call rather than a member method call on an instance.
+      const isVModuleCall =
+        ctx.lang === "v" &&
+        callee.viaMember &&
+        !!callee.receiver &&
+        ctx.vImportedModules.has(callee.receiver);
+      if (isVModuleCall) {
         edges.push({
-          ...callEdge,
-          viaMember: true,
-          recvType: ctx.enclosingClass!,
-          implicitSelf: true,
+          source: ctx.parentId,
+          relation: "calls",
+          name: callee.name,
+          viaMember: false,
+          file: ctx.rel,
         });
       } else {
-        const recvType = resolveRecvType(callee.receiver, ctx);
-        edges.push(recvType ? { ...callEdge, recvType } : callEdge);
+        const callEdge: RawEdge = {
+          source: ctx.parentId,
+          relation: "calls",
+          name: callee.name,
+          viaMember: callee.viaMember,
+          file: ctx.rel,
+          ...(callee.kinds ? { kinds: callee.kinds } : {}),
+        };
+        // Overloading languages: the call site's argument count, to pick the right
+        // overload (see RawEdge.argCount).
+        const argCount =
+          ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
+        if (argCount !== undefined) callEdge.argCount = argCount;
+        // Swift: a bare lowercase call inside a type body may be an implicit-`self`
+        // member call (`walk()` for `self.walk()`), syntactically indistinguishable
+        // from a free-function call — and Swift's own lookup is member-FIRST (inner
+        // scope wins). So the edge is emitted as the member reading, typed to the
+        // enclosing class — resolved through the owner-qualified method index and
+        // the class's in-repo ancestor chain (`clearLogs()` in a test subclass
+        // finds the base class's method) — with `implicitSelf` letting resolve.ts
+        // fall back to the free-function reading only when no member exists on the
+        // chain. One edge, both readings, language-order precedence. This is
+        // deliberately NOT a bare-name kind widening: dogfooding on
+        // swift-composable-architecture, a global unique-name match bound
+        // `contains(element)` inside `extension Set` — a stdlib call — to an
+        // unrelated type's only in-repo `contains`. And not for an UpperCamelCase
+        // callee: that is an initializer call (`Text("hi")`), which takes
+        // resolve.ts's class/struct/enum fallback instead — extension nodes (kind
+        // "module") can never false-match it.
+        const swiftImplicitSelf =
+          ctx.lang === "swift" &&
+          !callee.viaMember &&
+          !callee.kinds &&
+          ctx.enclosingClass &&
+          !/^[A-Z]/.test(callee.name);
+        if (swiftImplicitSelf) {
+          edges.push({
+            ...callEdge,
+            viaMember: true,
+            recvType: ctx.enclosingClass!,
+            implicitSelf: true,
+          });
+        } else {
+          const recvType = resolveRecvType(callee.receiver, ctx);
+          edges.push(recvType ? { ...callEdge, recvType } : callEdge);
+        }
       }
     }
   } else if (ctx.lang === "php" && node.type === "use_declaration") {
@@ -872,7 +914,58 @@ function collectImportedSymbols(
     return out;
   }
   if (lang === "php") return collectPhpImportedSymbols(root);
+  if (lang === "v") return collectVImportedSymbols(root);
   return new Map();
+}
+
+/** V selective symbol imports: `import math { sin, cos }` → local alias/name → { name, specifier }. */
+function collectVImportedSymbols(root: Parser.SyntaxNode): Map<string, { name: string; specifier: string }> {
+  const out = new Map<string, { name: string; specifier: string }>();
+  const visit = (node: Parser.SyntaxNode): void => {
+    if (node.type === "import_declaration") {
+      const p = node.childForFieldName("path") ?? node.namedChildren.find((c) => c.type === "import_path");
+      const specifier = p ? p.text : null;
+      const symbols = node.childForFieldName("symbols") ?? node.namedChildren.find((c) => c.type === "import_symbols");
+      if (specifier && symbols) {
+        const list = symbols.namedChildren.find((c) => c.type === "import_symbols_list");
+        if (list) {
+          for (const item of list.namedChildren) {
+            if (item.type === "identifier") {
+              out.set(item.text, { name: item.text, specifier });
+            }
+          }
+        }
+      }
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+  visit(root);
+  return out;
+}
+
+/** V imported modules in a file: returns all module identifiers (or aliases) that qualify calls. */
+function collectVImportedModules(root: Parser.SyntaxNode): Set<string> {
+  const out = new Set<string>();
+  const visit = (node: Parser.SyntaxNode): void => {
+    if (node.type === "import_declaration") {
+      const alias = node.childForFieldName("alias") ?? node.namedChildren.find((c) => c.type === "import_alias");
+      if (alias) {
+        const id =
+          alias.childForFieldName("name") ??
+          alias.namedChildren.find((c) => c.type === "module_identifier" || c.type === "identifier");
+        if (id) out.add(id.text);
+      } else {
+        const p = node.childForFieldName("path") ?? node.namedChildren.find((c) => c.type === "import_path");
+        if (p) {
+          const parts = p.text.split(".");
+          out.add(parts[parts.length - 1]);
+        }
+      }
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+  visit(root);
+  return out;
 }
 
 /** PHP `use` bindings: local alias → { exported name, FQN specifier }. */
@@ -1107,6 +1200,7 @@ function isDeclarationName(node: Parser.SyntaxNode): boolean {
  * TS arrow-consts. */
 function describe(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
   if (ctx.lang === "go") return describeGo(node, ctx);
+  if (ctx.lang === "v") return describeV(node, ctx);
   if (ctx.lang === "r") return describeR(node, ctx);
   if (ctx.lang === "java") return describeJava(node, ctx);
   if (ctx.lang === "kotlin") return describeKotlin(node, ctx);
@@ -1219,6 +1313,102 @@ function describeGo(node: Parser.SyntaxNode, _ctx: WalkCtx): DefDescriptor | nul
   }
 
   return null;
+}
+
+/** V definition shapes: functions, receiver methods, structs, interfaces, enums, type aliases, and constants. */
+function describeV(node: Parser.SyntaxNode, _ctx: WalkCtx): DefDescriptor | null {
+  if (node.type === "function_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    const recv = vReceiverType(node);
+    const body = node.childForFieldName("body");
+    const headerEnd = body ? body.startIndex : node.endIndex;
+    if (recv) {
+      return {
+        name,
+        idName: `${recv}.${name}`,
+        kind: "method",
+        headerEnd,
+        hashNode: node,
+        owner: recv,
+      };
+    }
+    return { name, kind: "function", headerEnd, hashNode: node };
+  }
+
+  if (node.type === "struct_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    const body = node.childForFieldName("body") ?? node.namedChildren.find((c) => c.type === "struct_field_declaration_list");
+    const headerEnd = body ? body.startIndex : node.endIndex;
+    return { name, kind: "struct", headerEnd, hashNode: node };
+  }
+
+  if (node.type === "interface_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    const body = node.childForFieldName("body") ?? node.namedChildren.find((c) => c.type === "interface_spec_list");
+    const headerEnd = body ? body.startIndex : node.endIndex;
+    return { name, kind: "interface", headerEnd, hashNode: node };
+  }
+
+  if (node.type === "enum_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    const body = node.childForFieldName("body") ?? node.namedChildren.find((c) => c.type === "enum_member_declaration_list");
+    const headerEnd = body ? body.startIndex : node.endIndex;
+    return { name, kind: "enum", headerEnd, hashNode: node };
+  }
+
+  if (node.type === "type_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    return { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
+  }
+
+  if (node.type === "const_spec") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    return { name, kind: "constant", headerEnd: node.endIndex, hashNode: node };
+  }
+
+  if (node.type === "interface_spec") {
+    const name = node.childForFieldName("name")?.text;
+    if (!name) return null;
+    const owner = _ctx.enclosingClass ?? undefined;
+    return {
+      name,
+      kind: "method",
+      headerEnd: node.endIndex,
+      hashNode: node,
+      owner,
+    };
+  }
+
+  return null;
+}
+
+/** The receiver's base type name for a V method (`fn (u &User) ...` -> `User`). Null if absent. */
+function vReceiverType(node: Parser.SyntaxNode): string | null {
+  const recv = node.childForFieldName("receiver");
+  if (!recv) return null;
+  const param = recv.namedChildren.find((c) => c.type === "parameter_declaration");
+  if (!param) return null;
+  const typeNode = param.childForFieldName("type");
+  if (!typeNode) return null;
+  return typeNode.text.replace(/^[&mut\s*]+/, "").trim() || null;
+}
+
+/** V visibility: a symbol is exported iff `pub` is present on the declaration. */
+function vExported(node: Parser.SyntaxNode): boolean {
+  if (node.children.some((c) => c.text === "pub") || node.text.trim().startsWith("pub")) return true;
+  if (node.parent && node.parent.type === "const_declaration") {
+    return node.parent.children.some((c) => c.text === "pub") || node.parent.text.trim().startsWith("pub");
+  }
+  if (node.parent && node.parent.type === "interface_spec_list" && node.parent.parent) {
+    return vExported(node.parent.parent);
+  }
+  return false;
 }
 
 /**
@@ -2111,6 +2301,29 @@ function heritageEdges(node: Parser.SyntaxNode, classId: string, ctx: WalkCtx): 
     }
     return edges;
   }
+  if (ctx.lang === "v" && node.type === "struct_declaration") {
+    const body =
+      node.childForFieldName("body") ??
+      node.namedChildren.find((c) => c.type === "struct_field_declaration_list");
+    if (body) {
+      for (const field of body.namedChildren) {
+        if (field.type === "struct_field_declaration") {
+          const hasName =
+            field.childForFieldName("name") ??
+            field.namedChildren.find((c) => c.type === "field_identifier");
+          if (!hasName) {
+            const typeNode =
+              field.childForFieldName("type") ??
+              field.namedChildren.find((c) => c.type === "type_identifier");
+            if (typeNode) {
+              edges.push({ source: classId, relation: "extends", name: typeNode.text, file: ctx.rel });
+            }
+          }
+        }
+      }
+    }
+    return edges;
+  }
   const heritage = node.namedChildren.find((c) => c.type === "class_heritage");
   for (const clause of heritage?.namedChildren ?? []) {
     const relation: Relation | null =
@@ -2275,7 +2488,7 @@ if (lang === "kotlin") {
     const a = fn.childForFieldName("attribute") ?? fn.namedChildren.at(-1);
     return a ? { name: a.text, viaMember: true, receiver: pyReceiver(fn) } : null;
   }
-  if (lang === "go" && fn.type === "selector_expression") {
+  if ((lang === "go" || lang === "v") && fn.type === "selector_expression") {
     // `pkg.Fn()` / `recv.Method()` — the called name is the trailing field.
     const p = fn.childForFieldName("field") ?? fn.namedChildren.at(-1);
     const operand = fn.childForFieldName("operand");
@@ -2473,6 +2686,7 @@ function isImport(node: Parser.SyntaxNode, lang: Language): boolean {
   // Go: match the per-import leaf, so single (`import "fmt"`) and grouped
   // (`import ( … )`) forms each yield one edge as the walk recurses into the list.
   if (lang === "go") return node.type === "import_spec";
+  if (lang === "v") return node.type === "import_declaration";
   if (lang === "r") {
     if (node.type !== "call") return false;
     const fn = node.childForFieldName("function");
@@ -2488,6 +2702,10 @@ if (lang === "kotlin") return node.type === "import_header";
 }
 
 function importSpecifier(node: Parser.SyntaxNode, lang: Language): string | null {
+  if (lang === "v") {
+    const p = node.childForFieldName("path") ?? node.namedChildren.find((c) => c.type === "import_path");
+    return p ? p.text : null;
+  }
   if (lang === "php") {
     // namespace_use_clause → its `qualified_name`/`name`, e.g. `App\Models\Animal`.
     const q = node.namedChildren.find((c) => c.type === "qualified_name" || c.type === "name");

@@ -58,6 +58,23 @@ export function defName(node: Parser.SyntaxNode, lang: Language): string | null 
     }
     return null;
   }
+  if (lang === "v") {
+    if (node.type === "function_declaration") {
+      const name = node.childForFieldName("name")?.text;
+      if (!name) return null;
+      const recv = vReceiverTypeOf(node);
+      return recv ? `${recv}.${name}` : name;
+    }
+    if (
+      node.type === "struct_declaration" ||
+      node.type === "interface_declaration" ||
+      node.type === "enum_declaration" ||
+      node.type === "type_declaration"
+    ) {
+      return node.childForFieldName("name")?.text ?? null;
+    }
+    return null;
+  }
   if (lang === "r") return rDefName(node);
   if (lang === "swift") return swiftDefName(node);
   if (lang === "php") {
@@ -189,6 +206,23 @@ function goReceiverTypeOf(node: Parser.SyntaxNode): string | null {
   return type?.type === "type_identifier" ? type.text : null;
 }
 
+/** The receiver parameter's own variable name for a V method (`fn (p &Point) …`
+ * → `p`). Null if it can't be read. */
+export function vReceiverVarOf(node: Parser.SyntaxNode): string | null {
+  const recv = node.childForFieldName("receiver");
+  const param = recv?.namedChildren.find((c) => c.type === "parameter_declaration");
+  return param?.childForFieldName("name")?.text ?? null;
+}
+
+/** The receiver's base type name for a V method, unwrapping pointer / mut. */
+function vReceiverTypeOf(node: Parser.SyntaxNode): string | null {
+  const recv = node.childForFieldName("receiver");
+  const param = recv?.namedChildren.find((c) => c.type === "parameter_declaration");
+  let type = param?.childForFieldName("type");
+  if (!type) return null;
+  return type.text.replace(/^[&mut\s*]+/, "").trim() || null;
+}
+
 /** Resolves a call site's receiver text (from `calleeName`) to a bound type
  * name, given the enclosing walk state. `self`/`cls`/`this`/the Go receiver
  * var resolve directly to the enclosing class; `super` — R6's `super$` and
@@ -215,12 +249,12 @@ export function resolveRecvType(
   // the receiver type. (Member calls pass a `$var` receiver, filtered by the `$`.)
   if (ctx.lang === "php" && !receiver.startsWith("$")) return receiver;
   return (
-    (ctx.lang === "go" && receiver === ctx.goReceiverVar ? ctx.enclosingClass : undefined) ??
+    ((ctx.lang === "go" || ctx.lang === "v") && receiver === ctx.goReceiverVar ? ctx.enclosingClass : undefined) ??
     ctx.bindings.lookup(ctx.scope, receiver) ??
-    // Swift type-member call `Animal.staticThing()`: an uppercase receiver with no
-    // local binding is the type itself (Swift naming: types are UpperCamelCase,
-    // values lowerCamelCase — and a shadowing binding was already tried above).
-    (ctx.lang === "swift" && /^[A-Z]/.test(receiver) ? receiver : undefined) ??
+    // Swift / V type-member call `Animal.staticThing()`: an uppercase receiver with no
+    // local binding is the type itself (naming: types are UpperCamelCase,
+    // values lowerCamelCase / snake_case — and a shadowing binding was already tried above).
+    ((ctx.lang === "swift" || ctx.lang === "v") && /^[A-Z]/.test(receiver) ? receiver : undefined) ??
     undefined
   );
 }
@@ -301,6 +335,7 @@ function visit(
 ): void {
   if (lang === "python") handlePy(node, scope, classScope, bindings, aliases);
   else if (lang === "go") handleGo(node, scope, bindings);
+  else if (lang === "v") handleV(node, scope, bindings);
   // R Phase 1 has no classes, so there's no member/receiver-type binding to
   // collect yet (see extract.ts's calleeName R branch) — no handleR needed.
   else if (lang === "r") void 0;
@@ -723,5 +758,83 @@ function handleGo(node: Parser.SyntaxNode, scope: string[], bindings: FileBindin
       if (fn?.type === "identifier" && /^New[A-Z]/.test(fn.text)) typeName = fn.text.slice(3);
     }
     if (typeName) bindings.set(scopePath, nameNode.text, typeName);
+  }
+}
+
+function vTypeNameFrom(node: Parser.SyntaxNode | null | undefined): string | null {
+  if (!node) return null;
+  if (node.type === "type_identifier") return node.text;
+  if (node.type === "qualified_type") {
+    const name = node.childForFieldName("name") ?? node.namedChildren[node.namedChildren.length - 1];
+    return name ? name.text : null;
+  }
+  return null;
+}
+
+function handleV(node: Parser.SyntaxNode, scope: string[], bindings: FileBindings): void {
+  const scopePath = scope.join(".");
+  if (node.type === "parameter_declaration") {
+    const name = node.childForFieldName("name")?.text;
+    const typeNode = node.childForFieldName("type");
+    let type = typeNode?.text;
+    if (name && type) {
+      type = type.replace(/^[&mut\s*]+/, "").trim();
+      const dot = type.lastIndexOf(".");
+      const finalType = dot >= 0 ? type.slice(dot + 1) : type;
+      bindings.set(scopePath, name, finalType);
+    }
+    return;
+  }
+  if (node.type === "for_in_operator") {
+    const left = node.childForFieldName("left") ?? node.namedChildren[0];
+    const right = node.childForFieldName("right") ?? node.namedChildren[1];
+    if (left && right) {
+      const vars = left.namedChildren;
+      const valNode = vars[vars.length - 1];
+      const valName = valNode?.text.replace(/^mut\s+/, "").trim();
+      if (valName) {
+        const rightType = bindings.lookup(scope, right.text);
+        if (rightType) {
+          const elemType = rightType.replace(/^\[\]/, "").replace(/\[\]$/, "").trim();
+          if (elemType) bindings.set(scopePath, valName, elemType);
+        }
+      }
+    }
+    return;
+  }
+  if (node.type !== "short_var_declaration") return;
+  const left = node.childForFieldName("left") ?? node.namedChildren[0];
+  const right = node.childForFieldName("right") ?? node.namedChildren[1];
+  if (!left || !right) return;
+  const names = left.namedChildren;
+  const exprs = right.namedChildren;
+  for (let i = 0; i < names.length; i++) {
+    const nameNode = names[i];
+    let expr = exprs[i];
+    if (!nameNode || !expr) continue;
+    const name = nameNode.text.replace(/^mut\s+/, "").trim();
+    if (!name) continue;
+    if (expr.type === "unary_expression") {
+      expr = expr.namedChildren.find((c) => c.type === "type_initializer") ?? expr;
+    }
+    let typeName: string | null = null;
+    if (expr.type === "type_initializer") {
+      const t = expr.childForFieldName("type") ?? expr.namedChildren[0];
+      typeName = vTypeNameFrom(t);
+    } else if (expr.type === "call_expression") {
+      const fn = expr.childForFieldName("function");
+      let callee = fn?.type === "selector_expression" ? fn.childForFieldName("field")?.text : fn?.text;
+      if (callee) {
+        if (/^new_|^create_/i.test(callee)) {
+          const raw = callee.replace(/^(new_|create_)/i, "");
+          typeName = raw.charAt(0).toUpperCase() + raw.slice(1);
+        } else if (/^New[A-Z]/.test(callee)) {
+          typeName = callee.slice(3);
+        } else if (/^[A-Z]/.test(callee)) {
+          typeName = callee;
+        }
+      }
+    }
+    if (typeName) bindings.set(scopePath, name, typeName);
   }
 }

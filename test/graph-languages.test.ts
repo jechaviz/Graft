@@ -32,6 +32,7 @@ const INDEXED = [
 "a.kt", "a.kts",
   "a.swift",
   "a.php",
+  "a.v", "a.vsh",
 ];
 
 test("a file is labelled exactly when it is indexed", () => {
@@ -66,6 +67,8 @@ assert.equal(languageLabelOf("src/main/kotlin/com/acme/App.kt"), "kotlin");
   assert.equal(languageLabelOf("scripts/main.kts"), "kotlin");
   assert.equal(languageLabelOf("Sources/App/main.swift"), "swift");
   assert.equal(languageLabelOf("app/Models/User.php"), "php");
+  assert.equal(languageLabelOf("src/main.v"), "v");
+  assert.equal(languageLabelOf("scripts/run.vsh"), "v");
 
   // The grammar is unchanged — extraction, the extract cache and every `Language`
   // switch still see exactly what they saw before.
